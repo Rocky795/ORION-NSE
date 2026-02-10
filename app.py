@@ -6,41 +6,55 @@ import upstox_client
 import os
 import json
 from datetime import datetime, timedelta
-from Executions.Logic import OptionExecutionEngine # Imports your Layer-2
+# If you haven't installed py_vollib, run: pip install py_vollib
+# from py_vollib.black_scholes.implied_volatility import implied_volatility 
+from Executions.Logic import OptionExecutionEngine 
 
 # --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
-MODEL_PATH = "models/nifty_hybrid_model.pkl" # Point to your saved model
-JSON_FILE_PATH = "data/NSE.json"
+# Helper to find files relative to this script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(SCRIPT_DIR, "Mode Training", "models", "nifty_hybrid_model.pkl")
+JSON_FILE_PATH = os.path.join(SCRIPT_DIR, "data", "NSE.json")
 
-# FLAGS
-PAPER_TRADING = True # Set to False only when you are ready to lose real money
+# RISK CONTROLS (Layer-3)
+PAPER_TRADING = True
+MAX_TRADES_PER_DAY = 1  
+RISK_FREE_RATE = 0.07   
 
 class LiveTrader:
     def __init__(self):
-        print("Initializing Orion Live Trader...")
+        print("Initializing Orion Live Trader (Layer-3)...")
         
-        # 1. Load Model
+        # 1. Load Brains
         if os.path.exists(MODEL_PATH):
             self.model = joblib.load(MODEL_PATH)
             print("✅ Layer-1 Model Loaded.")
         else:
-            raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+            # Fallback for folder structure issues
+            alt_path = os.path.join(SCRIPT_DIR, "Mode Training/models", "nifty_hybrid_model.pkl")
+            if os.path.exists(alt_path):
+                self.model = joblib.load(alt_path)
+                print("✅ Layer-1 Model Loaded (from alt path).")
+            else:
+                raise FileNotFoundError(f"Model not found at {MODEL_PATH} or {alt_path}")
             
-        # 2. Load Logic Engine
         self.engine = OptionExecutionEngine()
         print("✅ Layer-2 Logic Engine Loaded.")
         
-        # 3. Setup API
+        # 2. Setup API
         conf = upstox_client.Configuration()
         conf.access_token = UPSTOX_ACCESS_TOKEN
         self.api = upstox_client.HistoryV3Api(upstox_client.ApiClient(conf))
+        # Removed QuoteApi to fix the crash (not used in current logic)
         
-        # 4. Load Keys
+        # 3. State
         self.keys = self._get_keys()
+        self.trades_today = 0
+        self.iv_history = [] 
 
     def _get_keys(self):
-        # (Simplified version of your fetcher to get current keys)
+        """Reads instrument keys for Nifty Index and Futures."""
         with open(JSON_FILE_PATH, 'r') as f:
             data = json.load(f)
         df = pd.DataFrame(data)
@@ -53,23 +67,27 @@ class LiveTrader:
             'FUT': fut['instrument_key'],
             'INDEX': 'NSE_INDEX|Nifty 50',
             'VIX': 'NSE_INDEX|India VIX',
-            'EXPIRY': fut['expiry'] # Keep expiry for Logic context
+            'EXPIRY_DATE': fut['expiry'] 
         }
 
-    def fetch_live_features(self):
-        """Fetches last 50 candles to calculate live RSI, EMA, etc."""
-        print("   Fetching live market data...")
-        end_str = datetime.now().strftime('%Y-%m-%d')
-        start_str = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    def fetch_market_snapshot(self):
+        """
+        Fetches Spot, Future OI, and VIX.
+        """
+        print("   Fetching live market snapshot...")
         
-        # Fetch 3 streams
-        # Note: In production, handle API failures/retries here
+        # 1. Get Spot & Futures (OHLC)
+        end_str = datetime.now().strftime('%Y-%m-%d')
+        start_str = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        
+        # Fetch Candles
         fut_res = self.api.get_historical_candle_data1(self.keys['FUT'], "minutes", "15", end_str, start_str)
         idx_res = self.api.get_historical_candle_data1(self.keys['INDEX'], "minutes", "15", end_str, start_str)
         vix_res = self.api.get_historical_candle_data1(self.keys['VIX'], "minutes", "15", end_str, start_str)
         
         # Convert to DF
         def to_df(res):
+            if not res or not res.data: return pd.DataFrame()
             df = pd.DataFrame(res.data.candles, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'oi'])
             df['ts'] = pd.to_datetime(df['ts'])
             df.set_index('ts', inplace=True)
@@ -79,29 +97,27 @@ class LiveTrader:
         idx_df = to_df(idx_res)
         vix_df = to_df(vix_res)
         
-        # Merge (Inner Join)
+        # Merge for Model Input
         df = idx_df[['o','h','l','c']].join(fut_df[['oi']], how='inner').join(vix_df[['c']].rename(columns={'c':'vix'}), how='inner')
         df.sort_index(inplace=True)
         
-        # --- LIVE FEATURE ENGINEERING (Identical to Training) ---
-        # 1. Trend
+        # 2. Get IV (Using VIX for now)
+        real_iv = vix_df.iloc[-1]['c'] 
+        self.iv_history.append(real_iv)
+        
+        # --- FEATURE ENGINEERING (Same as Training) ---
         df['ema_20'] = df['c'].ewm(span=20, adjust=False).mean()
         df['dist_from_ema'] = (df['c'] - df['ema_20']) / df['ema_20']
         
-        # 2. RSI
         delta = df['c'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
-        # 3. Volatility
         df['std_20'] = df['c'].rolling(20).std()
-        df['bb_upper'] = df['ema_20'] + (2*df['std_20'])
-        df['bb_lower'] = df['ema_20'] - (2*df['std_20'])
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['ema_20']
+        df['bb_width'] = ((df['ema_20'] + 2*df['std_20']) - (df['ema_20'] - 2*df['std_20'])) / df['ema_20']
         
-        # 4. Sentiment
         df['oi_ma'] = df['oi'].rolling(5).mean()
         df['oi_slope'] = (df['oi'] - df['oi_ma']) / df['oi_ma']
         
@@ -110,77 +126,67 @@ class LiveTrader:
         df['sentiment_score'] = np.where((df['price_change'] > 0) & (df['oi_change'] > 0), 1, 
                                 np.where((df['price_change'] < 0) & (df['oi_change'] > 0), -1, 0))
         
-        # Extract LAST row (The one just closed)
         latest = df.iloc[-1]
-        
-        # Feature Vector (Must match training order)
         features = ['rsi', 'dist_from_ema', 'bb_width', 'oi_slope', 'sentiment_score', 'vix']
-        X_live = pd.DataFrame([latest[features]])
         
-        return X_live, latest['c'] # Return features and current Spot Price
+        return pd.DataFrame([latest[features]]), latest['c'], real_iv
 
     def run_cycle(self):
-        """Runs one decision cycle."""
         print(f"\n--- CYCLE START: {datetime.now().strftime('%H:%M:%S')} ---")
         
+        # Risk Check
+        if self.trades_today >= MAX_TRADES_PER_DAY:
+            print("🛑 Max trades reached. System Halted.")
+            return
+
         try:
             # 1. Layer-1: Prediction
-            X, spot_price = self.fetch_live_features()
+            X, spot_price, current_iv = self.fetch_market_snapshot()
             prob = self.model.predict_proba(X)[0][1]
-            direction = "BULLISH" # Model is binary buy/no-buy. If prob high -> Bullish. 
-            # Note: If your model was trained only on Longs, low prob = Neutral/No Trade, not necessarily Bearish.
             
-            print(f"   Spot: {spot_price:.2f}")
+            print(f"   Spot: {spot_price:.2f} | IV: {current_iv:.2f}")
             print(f"   L1 Prediction: Prob Buy = {prob:.4f}")
             
-            # 2. Prepare Layer-1 Output for Layer-2
-            l1_output = {
-                "direction": "BULLISH" if prob > 0.5 else "NEUTRAL", # Simplified for your Binary Model
-                "probability": prob
-            }
+            l1_output = {"direction": "BULLISH" if prob > 0.5 else "NEUTRAL", "probability": prob}
             
-            # 3. Layer-2: Logic
-            # Construct Market Context (Mocking IV history for now, assuming fetchable)
+            # 2. Layer-2: Logic
             market_context = {
                 "spot_price": spot_price,
-                "expiry_date": pd.to_datetime(self.keys['EXPIRY'], unit='ms').strftime('%Y-%m-%d'),
-                "current_iv": X.iloc[0]['vix'], # Approx proxy, or fetch real Option IV
-                "iv_history": [12, 13, 11, 14, 12] # Ideally fetch last 5 days VIX
+                "expiry_date": pd.to_datetime(self.keys['EXPIRY_DATE'], unit='ms').strftime('%Y-%m-%d'),
+                "current_iv": current_iv,
+                "iv_history": self.iv_history[-10:] if self.iv_history else [current_iv]
             }
             
             decision = self.engine.execute_logic(l1_output, market_context)
             
-            # 4. Layer-3: Execution
-            print(f"   L2 Decision: {decision['trade_decision']}")
-            if decision['trade_decision'] != "NO_TRADE":
-                self.execute_trade(decision)
+            # 3. Layer-3: Execution
+            print(f"   L2 Decision: {decision['decision']}")
+            
+            if decision['decision'] == "EXECUTE":
+                self.execute_complex_order(decision)
+                self.trades_today += 1
             else:
                 print(f"   Reason: {decision['reason']}")
                 
         except Exception as e:
             print(f"❌ Cycle Failed: {e}")
 
-    def execute_trade(self, decision):
-        symbol = f"NIFTY {decision['strike']} {decision['option_type']}"
+    def execute_complex_order(self, decision):
         print(f"\n🚀 EXECUTION TRIGGERED ({'PAPER' if PAPER_TRADING else 'LIVE'})")
-        print(f"   Contract: {symbol}")
-        print(f"   Action:   {decision['trade_decision']}")
-        print(f"   Reason:   {decision['reason']}")
+        print(f"   Strategy: {decision['strategy']}")
+        print(f"   Legs:")
         
-        if not PAPER_TRADING:
-            # self.api.place_order(...) 
-            pass
+        for leg in decision['legs']:
+            print(f"    - {leg['side']} {leg['type']} {leg['strike']}")
+            
+        print("   Status: Orders Placed (Simulated)")
 
 if __name__ == "__main__":
     trader = LiveTrader()
-    
-    # Run immediately once to test
     trader.run_cycle()
     
-    # Then loop forever (Scheduled)
-    print("\n✅ System Online. Waiting for 15-min candles...")
+    print("\n✅ System Online.")
     while True:
-        # Wait until the next 15th minute (:00, :15, :30, :45)
         now = datetime.now()
         next_run = now + timedelta(minutes=15 - (now.minute % 15))
         next_run = next_run.replace(second=0, microsecond=0)
@@ -188,7 +194,5 @@ if __name__ == "__main__":
         
         print(f"   Sleeping {int(sleep_sec)}s until {next_run.strftime('%H:%M')}...")
         time.sleep(sleep_sec)
-        
-        # Wake up and run
-        time.sleep(5) # Wait 5s for data to arrive at API
+        time.sleep(5) 
         trader.run_cycle()
