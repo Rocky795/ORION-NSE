@@ -64,9 +64,11 @@ ORION-NSE/
 
 ### 2️⃣ Install Dependencies
 
-```bash
+
 pip install upstox-python-sdk pandas numpy xgboost scikit-learn joblib py_vollib
-3️⃣ Environment Configuration
+
+
+### 3️⃣ Environment Configuration
 Set your Upstox access token as an environment variable.
 
 Windows (PowerShell)
@@ -75,8 +77,9 @@ $env:UPSTOX_ACCESS_TOKEN="your_access_token_here"
 Linux / macOS
 
 export UPSTOX_ACCESS_TOKEN="your_access_token_here"
-⚔️ How to Run
-🔁 Step 1: Update Data & Retrain (Daily / Weekend)
+
+## ⚔️ How to Run
+### 🔁 Step 1: Update Data & Retrain (Daily / Weekend)
 Fetch the latest data and retrain the model to adapt to new market regimes.
 
 python fetch_and_process.py
