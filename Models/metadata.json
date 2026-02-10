@@ -1,0 +1,47 @@
+{
+    "features": [
+        "log_ret_1",
+        "log_ret_3",
+        "log_ret_5",
+        "log_ret_15",
+        "atr_14",
+        "std_dev_20",
+        "sma_slope_20",
+        "sma_slope_50",
+        "rel_vol",
+        "hour",
+        "day_of_week"
+    ],
+    "classes": {
+        "0": "No Trade",
+        "1": "Buy Call",
+        "2": "Buy Put"
+    },
+    "threshold": 0.0015,
+    "horizon_candles": 6,
+    "model_params": {
+        "bootstrap": true,
+        "ccp_alpha": 0.0,
+        "class_weight": {
+            "0": 0.7230948225712623,
+            "1": 1.2656230113274787,
+            "2": 1.2092910130122827
+        },
+        "criterion": "gini",
+        "max_depth": 10,
+        "max_features": "sqrt",
+        "max_leaf_nodes": null,
+        "max_samples": null,
+        "min_impurity_decrease": 0.0,
+        "min_samples_leaf": 1,
+        "min_samples_split": 2,
+        "min_weight_fraction_leaf": 0.0,
+        "monotonic_cst": null,
+        "n_estimators": 200,
+        "n_jobs": -1,
+        "oob_score": false,
+        "random_state": 42,
+        "verbose": 0,
+        "warm_start": false
+    }
+}

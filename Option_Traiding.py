@@ -1,32 +1,18 @@
 """
 ORION-NSE : LIVE OPTION SIGNAL ENGINE (SIGNAL ONLY)
 
-IMPORTANT SAFETY GUARANTEES:
+SAFETY GUARANTEES:
 - NO order placement
 - NO trading endpoints
 - READ-ONLY market data
-- User must choose strategy at startup
 - Strategy locked for entire session
-
-This script:
-- Uses NIFTY INDEX only for ATM strike discovery
-- Trades are SIGNALS on NIFTY OPTIONS
-- ML model is used as a FILTER, not a predictor (temporary compromise)
 """
-
-# ============================
-# STANDARD IMPORTS
-# ============================
-
-import os
-import sys
-import time
-import math
 import json
+import os
+import time
 import joblib
 import requests
 import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -38,162 +24,169 @@ load_dotenv()
 
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 if not UPSTOX_ACCESS_TOKEN:
-    raise RuntimeError("UPSTOX_ACCESS_TOKEN not set in environment variables")
+    raise RuntimeError("UPSTOX_ACCESS_TOKEN not set")
 
-BASE_URL = "https://api.upstox.com/v2"
+BASE_URL_V2 = "https://api.upstox.com/v2"
+
 HEADERS = {
     "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-    "Accept": "application/json"
+    "Accept": "application/json",
+    "Content-Type": "application/json",
 }
 
 # ============================
-# USER STRATEGY SELECTION
+# STRATEGY SELECTION
 # ============================
 
 def select_strategy():
     choice = input("Select strategy (BUYING / SELLING): ").strip().upper()
-    if choice not in {"BUYING", "SELLING"}:
-        raise ValueError("Invalid strategy selection")
+    if choice not in ("BUYING", "SELLING"):
+        raise ValueError("Invalid strategy")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ACTIVE STRATEGY LOCKED: {choice}")
     return choice
 
 # ============================
-# MODEL LOADING
+# LOAD MODEL
 # ============================
 
 def load_model():
-    model = joblib.load("model.pkl")
-    scaler = joblib.load("scaler.pkl")
-    features = joblib.load("features.pkl")
+    model = joblib.load("logistic_regression_model.pkl")
+    scaler = joblib.load("logistic_regression_scaler.pkl")
+    features = joblib.load("logistic_regression_features.pkl")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Model and scaler loaded")
     return model, scaler, features
 
 # ============================
-# INDEX QUOTE (REFERENCE ONLY)
+# NIFTY LTP (REFERENCE ONLY)
 # ============================
 
 def get_nifty_ltp():
-    url = f"{BASE_URL}/market-quote/quotes"
+    url = f"{BASE_URL_V2}/market-quote/quotes"
     params = {"instrument_key": "NSE_INDEX|Nifty 50"}
+
     r = requests.get(url, headers=HEADERS, params=params, timeout=10)
     r.raise_for_status()
-    data = r.json()["data"]
-    return data["NSE_INDEX|Nifty 50"]["last_price"]
+
+    for v in r.json().get("data", {}).values():
+        if "last_price" in v:
+            return v["last_price"]
+
+    raise RuntimeError("Failed to fetch NIFTY LTP")
 
 # ============================
-# OPTION SELECTION
+# OPTION CHAIN
 # ============================
 
-def nearest_weekly_expiry():
-    today = datetime.now().date()
-    # NSE weekly expiry is Thursday
-    days_ahead = (3 - today.weekday()) % 7
-    expiry = today + timedelta(days=days_ahead)
-    return expiry.strftime("%d%b%y").upper()
 
-def round_to_50(price):
-    return int(round(price / 50) * 50)
-
-def option_instrument(strike, expiry, opt_type):
-    return f"NSE_FO|NIFTY{expiry}{strike}{opt_type}"
-
-# ============================
-# OPTION CANDLE FETCH
-# ============================
-
-def fetch_option_candles(instrument_key, minutes=60):
-    end = datetime.now()
-    start = end - timedelta(minutes=minutes)
-
-    url = f"{BASE_URL}/historical-candle/intraday"
+def fetch_option_chain(expiry_date):
+    url = f"{BASE_URL_V2}/option/chain"
     params = {
-        "instrument_key": instrument_key,
-        "interval": "5minute",
-        "from": start.strftime("%Y-%m-%d %H:%M"),
-        "to": end.strftime("%Y-%m-%d %H:%M")
+        "instrument_key": "NSE_INDEX|Nifty 50",
+        "expiry_date": expiry_date
     }
 
     r = requests.get(url, headers=HEADERS, params=params, timeout=10)
     r.raise_for_status()
 
-    candles = r.json()["data"]["candles"]
-    if not candles or len(candles) < 6:
-        return None
+    return r.json().get("data", [])
 
-    df = pd.DataFrame(
-        candles,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
-    return df
+
+
+def normalize_expiry(exp):
+    if isinstance(exp, int):
+        return datetime.fromtimestamp(exp).strftime("%Y-%m-%d")
+    if isinstance(exp, str):
+        return exp
+    return None
+
+
+def get_valid_nifty_expiries():
+    if not os.path.exists("NSE.json"):
+        raise RuntimeError("Instrument master file NSE.json not found")
+
+    with open("NSE.json", "r") as f:
+        instruments = json.load(f)
+
+    expiries = set()
+
+    for inst in instruments:
+        if inst.get("underlying_symbol") != "NIFTY":
+            continue
+
+        raw_exp = inst.get("expiry")
+        if not raw_exp:
+            continue
+
+        norm = normalize_expiry(raw_exp)
+        if norm:
+            expiries.add(norm)
+
+    if not expiries:
+        raise RuntimeError("No NIFTY expiries found in instrument master")
+
+    return sorted(expiries)
+
+
+def get_nearest_valid_expiry():
+    today = datetime.now().date()
+
+    for exp in get_valid_nifty_expiries():
+        exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+        if exp_date >= today:
+            return exp
+
+    raise RuntimeError("No future NIFTY expiry available")
+
+
+
 
 # ============================
-# FEATURE MAPPING (TEMPORARY)
+# FEATURE PROXY (TEMPORARY)
 # ============================
 
-def create_live_features(df):
+def build_feature_vector(opt):
     """
-    We deliberately reuse the OLD feature logic.
-    Option OHLC is treated like underlying OHLC.
-    Model acts only as a FILTER.
+    Proxy features to satisfy old ML model.
+    ML is used only as a FILTER.
     """
 
-    df = df.copy()
-    df["return"] = df["close"].pct_change()
-    df["range"] = (df["high"] - df["low"]) / df["close"]
-    df["momentum"] = df["close"] - df["close"].shift(3)
-    df["volatility"] = df["return"].rolling(5).std()
+    md = opt["market_data"]
+    og = opt["option_greeks"]
 
-    df = df.dropna()
-    if df.empty:
-        return None
-
-    return df.iloc[-1]
+    return {
+        "return": 0.0,
+        "range": (md["ask_price"] - md["bid_price"]) / max(md["ltp"], 1),
+        "momentum": md["ltp"] - md["close_price"],
+        "volatility": og["iv"] / 100.0,
+    }
 
 # ============================
-# SIGNAL GENERATION
+# SIGNAL LOGIC
 # ============================
 
-def generate_signal(
-    strategy,
-    option_type,
-    prob,
-    opt_row
-):
-    """
-    ML probability is only a GATE.
-    Strategy logic does the real work.
-    """
-
-    price_change = opt_row["momentum"]
-    vol = opt_row["volatility"]
-
+def generate_signal(strategy, prob, greeks):
     if strategy == "BUYING":
-        if prob > 0.65 and price_change > 0 and vol > 0.01:
-            return f"BUY {option_type}"
+        if prob > 0.65 and abs(greeks["delta"]) > 0.4 and greeks["iv"] > 15:
+            return "BUY"
     else:
-        if 0.45 < prob < 0.55 and vol < 0.01:
-            return f"SELL {option_type}"
-
+        if 0.45 < prob < 0.55 and greeks["theta"] < -5 and greeks["iv"] > 20:
+            return "SELL"
     return "NO TRADE"
 
 # ============================
-# RISK FILTERS
+# MAIN LOOP
 # ============================
 
 MAX_SIGNALS_PER_DAY = 3
 COOLDOWN_MINUTES = 30
 NO_TRADE_AFTER = datetime.strptime("15:00", "%H:%M").time()
 
-# ============================
-# MAIN LOOP
-# ============================
-
 def main_loop():
     strategy = select_strategy()
     model, scaler, feature_names = load_model()
 
     trades_today = 0
-    last_signal_time = None
+    last_signal = None
 
     while True:
         now = datetime.now()
@@ -203,52 +196,66 @@ def main_loop():
             break
 
         if trades_today >= MAX_SIGNALS_PER_DAY:
-            print("Max signals reached for the day.")
+            print("Max signals reached.")
             break
 
-        if last_signal_time and (now - last_signal_time).seconds < COOLDOWN_MINUTES * 60:
+        if last_signal and (now - last_signal).seconds < COOLDOWN_MINUTES * 60:
             time.sleep(30)
             continue
 
         try:
-            nifty_ltp = get_nifty_ltp()
-            atm = round_to_50(nifty_ltp)
-            expiry = nearest_weekly_expiry()
+            nifty = get_nifty_ltp()
+            expiry = get_nearest_valid_expiry()
+            chain = fetch_option_chain(expiry)
 
-            ce = option_instrument(atm, expiry, "CE")
-            pe = option_instrument(atm, expiry, "PE")
 
-            for opt_key, opt_type in [(ce, "CALL"), (pe, "PUT")]:
-                df = fetch_option_candles(opt_key)
-                if df is None:
-                    continue
+            if not chain:
+                print(f"[{now.strftime('%H:%M:%S')}] Option chain empty for expiry {expiry}. Retrying...")
+                time.sleep(30)
+                continue
 
-                features = create_live_features(df)
-                if features is None:
-                    continue
+            atm = min(chain, key=lambda x: abs(x["strike_price"] - nifty))
 
-                X = features[feature_names].values.reshape(1, -1)
-                X_scaled = scaler.transform(X)
-                prob = model.predict_proba(X_scaled)[0][1]
 
-                signal = generate_signal(strategy, opt_type, prob, features)
+            legs = []
+
+            if atm.get("call_options"):
+                legs.append((atm["call_options"], "CALL"))
+
+            if atm.get("put_options"):
+                legs.append((atm["put_options"], "PUT"))
+
+            if not legs:
+                print("ATM strike has no tradable options. Skipping.")
+                time.sleep(30)
+                continue
+
+            for opt_type, label in legs:
+
+                feats = build_feature_vector(opt_type)
+                X = np.array([feats[f] for f in feature_names]).reshape(1, -1)
+                Xs = scaler.transform(X)
+                prob = model.predict_proba(Xs)[0][1]
+
+                signal = generate_signal(strategy, prob, opt_type["option_greeks"])
 
                 print(
-                    f"[{now.strftime('%H:%M:%S')}] "
-                    f"{signal} | {opt_key} | Prob={prob:.3f}"
+                    f"[{now.strftime('%H:%M:%S')}] {signal} {label} | "
+                    f"LTP={opt_type['market_data']['ltp']} | "
+                    f"Prob={prob:.3f}"
                 )
 
                 if signal != "NO TRADE":
                     trades_today += 1
-                    last_signal_time = now
+                    last_signal = now
 
         except Exception as e:
             print(f"ERROR: {e}")
 
-        time.sleep(300)  # 5-minute cycle
+        time.sleep(30)
 
 # ============================
-# ENTRY POINT
+# ENTRY
 # ============================
 
 if __name__ == "__main__":
