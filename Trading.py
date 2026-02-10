@@ -21,6 +21,9 @@ import numpy as np
 import joblib
 from sklearn.preprocessing import StandardScaler
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # =========================
 # CONFIGURATION
 # =========================
