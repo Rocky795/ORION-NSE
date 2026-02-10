@@ -6,13 +6,12 @@ import upstox_client
 import os
 import json
 from datetime import datetime, timedelta
-# If you haven't installed py_vollib, run: pip install py_vollib
-# from py_vollib.black_scholes.implied_volatility import implied_volatility 
+# Ensure py_vollib is installed: pip install py_vollib
+from py_vollib.black_scholes.implied_volatility import implied_volatility 
 from Executions.Logic import OptionExecutionEngine 
 
 # --- CONFIGURATION ---
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
-# Helper to find files relative to this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "Mode Training", "models", "nifty_hybrid_model.pkl")
 JSON_FILE_PATH = os.path.join(SCRIPT_DIR, "data", "NSE.json")
@@ -31,13 +30,13 @@ class LiveTrader:
             self.model = joblib.load(MODEL_PATH)
             print("✅ Layer-1 Model Loaded.")
         else:
-            # Fallback for folder structure issues
-            alt_path = os.path.join(SCRIPT_DIR, "Mode Training/models", "nifty_hybrid_model.pkl")
+            # Fallback path check
+            alt_path = os.path.join(SCRIPT_DIR, "models", "nifty_hybrid_model.pkl")
             if os.path.exists(alt_path):
                 self.model = joblib.load(alt_path)
                 print("✅ Layer-1 Model Loaded (from alt path).")
             else:
-                raise FileNotFoundError(f"Model not found at {MODEL_PATH} or {alt_path}")
+                raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
             
         self.engine = OptionExecutionEngine()
         print("✅ Layer-2 Logic Engine Loaded.")
@@ -46,7 +45,6 @@ class LiveTrader:
         conf = upstox_client.Configuration()
         conf.access_token = UPSTOX_ACCESS_TOKEN
         self.api = upstox_client.HistoryV3Api(upstox_client.ApiClient(conf))
-        # Removed QuoteApi to fix the crash (not used in current logic)
         
         # 3. State
         self.keys = self._get_keys()
@@ -70,10 +68,62 @@ class LiveTrader:
             'EXPIRY_DATE': fut['expiry'] 
         }
 
+    def _get_atm_contract(self, spot_price, expiry_ms):
+        """Hunts for the specific ATM Call Option Key in NSE.json"""
+        atm_strike = round(spot_price / 50) * 50
+        
+        # Load JSON to find specific option key
+        with open(JSON_FILE_PATH, 'r') as f:
+            data = json.load(f)
+        df = pd.DataFrame(data)
+        
+        # Filter: NSE_FO, NIFTY, CE, ATM Strike, Correct Expiry
+        mask = (
+            (df['segment'] == 'NSE_FO') & 
+            (df['name'] == 'NIFTY') & 
+            (df['instrument_type'] == 'CE') & 
+            (df['strike_price'] == atm_strike) &
+            (df['expiry'] == expiry_ms)
+        )
+        
+        results = df[mask]
+        
+        if not results.empty:
+            contract = results.iloc[0]
+            # print(f"   🎯 Found ATM Contract: {contract['trading_symbol']}")
+            return contract['instrument_key'], atm_strike
+        else:
+            return None, None
+
+    def _fetch_and_calculate_iv(self, instrument_key, spot, strike, expiry_ms):
+        """Fetches live option price -> Calculates Implied Volatility (IV)"""
+        try:
+            # Get last 1-minute candle of the option to get price
+            end_str = datetime.now().strftime('%Y-%m-%d')
+            start_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            
+            res = self.api.get_historical_candle_data1(instrument_key, "minutes", "1", end_str, start_str)
+            
+            if not res or not res.data or not res.data.candles:
+                return 0.0
+                
+            last_close = res.data.candles[0][4] 
+            
+            # Time to Expiry (Years)
+            expiry_date = pd.to_datetime(expiry_ms, unit='ms')
+            minutes_to_expiry = (expiry_date - datetime.now()).total_seconds() / 60
+            T = minutes_to_expiry / (365 * 24 * 60)
+            
+            if T <= 0.001: return 0.0
+            
+            # Reverse Engineer IV
+            iv = implied_volatility(last_close, spot, strike, T, RISK_FREE_RATE, 'c')
+            return iv * 100 
+            
+        except Exception:
+            return 0.0
+
     def fetch_market_snapshot(self):
-        """
-        Fetches Spot, Future OI, and VIX.
-        """
         print("   Fetching live market snapshot...")
         
         # 1. Get Spot & Futures (OHLC)
@@ -94,18 +144,29 @@ class LiveTrader:
             return df
         
         fut_df = to_df(fut_res)
-        idx_df = to_df(idx_res)
+        idx_df = to_df(idx_res)  # <--- This is defined here now
         vix_df = to_df(vix_res)
         
         # Merge for Model Input
         df = idx_df[['o','h','l','c']].join(fut_df[['oi']], how='inner').join(vix_df[['c']].rename(columns={'c':'vix'}), how='inner')
         df.sort_index(inplace=True)
         
-        # 2. Get IV (Using VIX for now)
-        real_iv = vix_df.iloc[-1]['c'] 
+        # 2. Get Real IV
+        spot_price = idx_df.iloc[-1]['c']
+        expiry_ms = self.keys['EXPIRY_DATE']
+        
+        # Find ATM Option & Calc IV
+        atm_key, atm_strike = self._get_atm_contract(spot_price, expiry_ms)
+        
+        if atm_key:
+            real_iv = self._fetch_and_calculate_iv(atm_key, spot_price, atm_strike, expiry_ms)
+            if real_iv == 0: real_iv = vix_df.iloc[-1]['c'] # Fallback if calc fails
+        else:
+            real_iv = vix_df.iloc[-1]['c'] # Fallback to VIX if lookup fails
+            
         self.iv_history.append(real_iv)
         
-        # --- FEATURE ENGINEERING (Same as Training) ---
+        # --- FEATURE ENGINEERING ---
         df['ema_20'] = df['c'].ewm(span=20, adjust=False).mean()
         df['dist_from_ema'] = (df['c'] - df['ema_20']) / df['ema_20']
         
@@ -134,7 +195,6 @@ class LiveTrader:
     def run_cycle(self):
         print(f"\n--- CYCLE START: {datetime.now().strftime('%H:%M:%S')} ---")
         
-        # Risk Check
         if self.trades_today >= MAX_TRADES_PER_DAY:
             print("🛑 Max trades reached. System Halted.")
             return
@@ -144,7 +204,7 @@ class LiveTrader:
             X, spot_price, current_iv = self.fetch_market_snapshot()
             prob = self.model.predict_proba(X)[0][1]
             
-            print(f"   Spot: {spot_price:.2f} | IV: {current_iv:.2f}")
+            print(f"   Spot: {spot_price:.2f} | Real IV: {current_iv:.2f}%")
             print(f"   L1 Prediction: Prob Buy = {prob:.4f}")
             
             l1_output = {"direction": "BULLISH" if prob > 0.5 else "NEUTRAL", "probability": prob}
@@ -175,10 +235,8 @@ class LiveTrader:
         print(f"\n🚀 EXECUTION TRIGGERED ({'PAPER' if PAPER_TRADING else 'LIVE'})")
         print(f"   Strategy: {decision['strategy']}")
         print(f"   Legs:")
-        
         for leg in decision['legs']:
             print(f"    - {leg['side']} {leg['type']} {leg['strike']}")
-            
         print("   Status: Orders Placed (Simulated)")
 
 if __name__ == "__main__":
